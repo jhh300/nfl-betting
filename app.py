@@ -131,6 +131,12 @@ _ESPN_CSS = """
 </style>
 """
 
+import html as _html
+
+def _esc(x) -> str:
+    """Escape third-party strings (team/book names, times) before HTML interpolation."""
+    return _html.escape(str(x)) if x is not None else ""
+
 def _fmt_odds(a) -> str:
     try:
         a = float(a)
@@ -181,10 +187,10 @@ def render_espn_picks(picks: pd.DataFrame, pred: pd.DataFrame | None) -> None:
             stake_txt = f"${stake:,.0f}" if pd.notna(stake) and stake > 0 else "—"
             mkt = {"moneyline": "ML", "spreads": "Spread", "totals": "Total"}.get(r.get("market_key"), r.get("market_key"))
             pick_rows.append(
-                f'<div class="espn-pick"><span class="mkt">{mkt}</span>'
-                f'<span class="sel">{_pick_selection(r)}</span>'
+                f'<div class="espn-pick"><span class="mkt">{_esc(mkt)}</span>'
+                f'<span class="sel">{_esc(_pick_selection(r))}</span>'
                 f'<span class="odds">{_fmt_odds(r.get("odds_american"))}</span>'
-                f'<span class="book">{r.get("book_title") or ""}</span>'
+                f'<span class="book">{_esc(r.get("book_title") or "")}</span>'
                 f'<span class="ev {ev_cls}">{ev_txt}</span>'
                 f'<span class="stake">{stake_txt}</span></div>'
             )
@@ -198,11 +204,11 @@ def render_espn_picks(picks: pd.DataFrame, pred: pd.DataFrame | None) -> None:
             note += f'<div class="espn-note">+{n_more} more pick{"s" if n_more > 1 else ""} in table view</div>'
         cards.append(
             f'<div class="espn-card">'
-            f'<div class="espn-head"><span>{head_l}</span><span>{kick}</span></div>'
-            f'<div class="espn-team{away_dim}"><img src="{_logo_url(away)}"/>'
-            f'<span class="abbr">{away}</span><span class="sub">Away</span><span class="proj">{a_pts}</span></div>'
-            f'<div class="espn-team{home_dim}"><img src="{_logo_url(home)}"/>'
-            f'<span class="abbr">{home}</span><span class="sub">Home</span><span class="proj">{h_pts}</span></div>'
+            f'<div class="espn-head"><span>{head_l}</span><span>{_esc(kick)}</span></div>'
+            f'<div class="espn-team{away_dim}"><img src="{_esc(_logo_url(away))}"/>'
+            f'<span class="abbr">{_esc(away)}</span><span class="sub">Away</span><span class="proj">{a_pts}</span></div>'
+            f'<div class="espn-team{home_dim}"><img src="{_esc(_logo_url(home))}"/>'
+            f'<span class="abbr">{_esc(home)}</span><span class="sub">Home</span><span class="proj">{h_pts}</span></div>'
             f'<div class="espn-picks">{"".join(pick_rows)}</div>{note}'
             f'</div>'
         )
@@ -265,7 +271,13 @@ if not _env_key:
         _env_key = st.secrets.get("THE_ODDS_API_KEY", "")   # Streamlit Cloud secrets
     except Exception:
         pass
-api_key      = st.sidebar.text_input("The Odds API key", value=_env_key, type="password", key="api_key")
+# SECURITY: never pre-fill the widget with the server-side key — widget values
+# are sent to the viewer's browser. The input is an override only.
+_key_override = st.sidebar.text_input(
+    "The Odds API key" + (" (configured — leave blank)" if _env_key else ""),
+    value="", type="password", key="api_key",
+    help="Leave blank to use the key from .env / Streamlit secrets.")
+api_key = _key_override or _env_key
 books        = st.sidebar.text_input("Bookmakers (comma-separated)", value="fanduel,draftkings,betmgm", key="books_text")
 season_pick  = st.sidebar.number_input("Season (target)", min_value=2000, max_value=2100, value=int(utc_now_year()), step=1, key="season_input")
 markets_choice = st.sidebar.multiselect(

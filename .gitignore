@@ -1,0 +1,16 @@
+# Secrets — never commit the API key
+.env
+.streamlit/secrets.toml
+
+# Virtualenv and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Local data (bets DB, saved pick sheets, basketball cache)
+data/
+
+# OS / editor noise
+.DS_Store
+streamlit.log
+.claude/

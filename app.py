@@ -214,6 +214,47 @@ def render_espn_picks(picks: pd.DataFrame, pred: pd.DataFrame | None) -> None:
         )
     st.markdown(_ESPN_CSS + f'<div class="espn-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
+# ---- Tweet generation --------------------------------------------------------
+
+_MARKET_EMOJI = {"moneyline": "💰", "spreads": "📊", "totals": "🎯"}
+
+def _tweet_text(r: pd.Series) -> str:
+    matchup = f"{_esc_plain(r['away_team'])} @ {_esc_plain(r['home_team'])}"
+    sel     = _pick_selection(r)
+    odds    = _fmt_odds(r.get("odds_american"))
+    ev      = pd.to_numeric(pd.Series([r.get("ev_per_usd")]), errors="coerce").iloc[0]
+    book    = r.get("book_title") or ""
+    emoji   = _MARKET_EMOJI.get(r.get("market_key"), "🏈")
+    week    = r.get("week")
+    wk_txt  = f" Wk{int(week)}" if pd.notna(week) else ""
+
+    lines = [f"🏈 NFL{wk_txt}: {matchup}", f"{emoji} {sel} ({odds}){f' — {book}' if book else ''}"]
+    if pd.notna(ev):
+        lines.append(f"Model edge: {ev:+.1%} EV")
+    lines.append("#NFLPicks #NFLBetting")
+    text = "\n".join(lines)
+
+    if len(text) > 280:  # trim the book name first, then drop the hashtags
+        lines[1] = f"{emoji} {sel} ({odds})"
+        text = "\n".join(lines)
+    if len(text) > 280:
+        text = "\n".join(lines[:-1])
+    return text[:280]
+
+def _esc_plain(x) -> str:
+    """Plain-text (non-HTML) cleanup for tweet bodies."""
+    return str(x) if x is not None else ""
+
+def build_tweets(picks: pd.DataFrame, per_week: int = 5) -> dict:
+    """Top-N picks by EV for each week present in `picks`, formatted as tweets."""
+    if picks is None or picks.empty: return {}
+    out = {}
+    for wk, grp in picks.groupby(picks["week"].astype("Int64")):
+        if pd.isna(wk): continue
+        top = grp.sort_values("ev_per_usd", ascending=False).head(per_week)
+        out[int(wk)] = [_tweet_text(r) for _, r in top.iterrows()]
+    return dict(sorted(out.items()))
+
 PICKS_COLUMN_CONFIG = {
     "p_true":              st.column_config.NumberColumn("Model win prob", format="percent"),
     "book_p_devig":        st.column_config.NumberColumn("Book prob (devig)", format="percent"),
@@ -478,6 +519,17 @@ with tab_picks:
         with st.expander(f"Table view (top {top_n} of filtered picks)", expanded=False):
             st.dataframe(pick_top(shown, top_n), use_container_width=True,
                          column_config=PICKS_COLUMN_CONFIG, hide_index=True)
+
+        with st.expander("📝 Share picks (tweets)", expanded=False):
+            st.caption("Top 5 picks by EV for each week, formatted to post — click the copy icon "
+                       "in the top-right of each box.")
+            tweets_by_week = build_tweets(picks, per_week=5)
+            if not tweets_by_week:
+                st.info("No picks with a week number to build tweets from.")
+            for wk, tweets in tweets_by_week.items():
+                st.markdown(f"**Week {wk}**")
+                for t in tweets:
+                    st.code(t, language=None)
         st.download_button("Download picks CSV", picks.to_csv(index=False), "picks.csv", "text/csv")
         with st.expander("Predicted Scores", expanded=False):
             if pred_all is not None:

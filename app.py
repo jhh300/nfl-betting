@@ -163,10 +163,15 @@ def render_espn_picks(picks: pd.DataFrame, pred: pd.DataFrame | None) -> None:
             info[g["game_id"]] = g
     order = (picks.groupby("game_id")["ev_per_usd"].max()
                   .sort_values(ascending=False).index.tolist())
+    _market_order = {"moneyline": 0, "spreads": 1, "totals": 2}
     cards = []
     for gid in order:
         all_rows = picks[picks["game_id"] == gid].sort_values("ev_per_usd", ascending=False)
-        rows = all_rows.head(3)   # best 3 picks per game; the rest live in the table view
+        # One line per market (best-priced book), so ML and spread both show
+        # instead of one market sweeping all slots because it has the best EV.
+        rows = (all_rows.drop_duplicates("market_key", keep="first")
+                        .assign(_ord=lambda d: d["market_key"].map(_market_order).fillna(9))
+                        .sort_values("_ord").drop(columns="_ord"))
         n_more = len(all_rows) - len(rows)
         r0 = rows.iloc[0]
         home, away = r0.get("home_team", "?"), r0.get("away_team", "?")
@@ -194,10 +199,11 @@ def render_espn_picks(picks: pd.DataFrame, pred: pd.DataFrame | None) -> None:
                 f'<span class="ev {ev_cls}">{ev_txt}</span>'
                 f'<span class="stake">{stake_txt}</span></div>'
             )
-        best = rows.iloc[0]
+        spread_rows = rows[rows["market_key"].eq("spreads")]
+        note_row = spread_rows.iloc[0] if not spread_rows.empty else rows.iloc[0]
         note = ""
-        ml_val = pd.to_numeric(pd.Series([best.get("model_line")]), errors="coerce").iloc[0]
-        ep_val = pd.to_numeric(pd.Series([best.get("edge_pts")]), errors="coerce").iloc[0]
+        ml_val = pd.to_numeric(pd.Series([note_row.get("model_line")]), errors="coerce").iloc[0]
+        ep_val = pd.to_numeric(pd.Series([note_row.get("edge_pts")]), errors="coerce").iloc[0]
         if pd.notna(ml_val) and pd.notna(ep_val):
             note = f'<div class="espn-note">Model line {ml_val:+.1f} &bull; {ep_val:+.1f} pts vs book</div>'
         if n_more > 0:

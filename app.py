@@ -93,6 +93,52 @@ def filter_picks(picks: pd.DataFrame, slot_by_game: dict,
         f = f[f["game_id"].map(slot_by_game).eq(slot)]
     return f
 
+# ---- Per-game summary: model's predicted side vs. the best-EV market pick ----
+
+def _model_ml_label(home: str, away: str, p_home) -> str:
+    p = pd.to_numeric(pd.Series([p_home]), errors="coerce").iloc[0]
+    if pd.isna(p): return "—"
+    return f"{home} ({p:.0%})" if p >= 0.5 else f"{away} ({1-p:.0%})"
+
+def _model_spread_label(home: str, away: str, margin) -> str:
+    m = pd.to_numeric(pd.Series([margin]), errors="coerce").iloc[0]
+    if pd.isna(m): return "—"
+    if abs(m) < 0.05: return "PK"
+    return f"{home} -{m:.1f}" if m > 0 else f"{away} -{-m:.1f}"
+
+def _best_ev_label(rows: pd.DataFrame) -> str:
+    """The single highest-EV candidate for a game+market, formatted for display.
+    Shows the best candidate even if it's not positive-EV, labeling it clearly."""
+    if rows is None or rows.empty: return "No line"
+    r = rows.sort_values("ev_per_usd", ascending=False).iloc[0]
+    ev = pd.to_numeric(pd.Series([r.get("ev_per_usd")]), errors="coerce").iloc[0]
+    sel  = _pick_selection(r)
+    odds = _fmt_odds(r.get("odds_american"))
+    book = r.get("book_title") or ""
+    if pd.isna(ev) or ev <= 0:
+        return f"{sel} ({odds}) {book} — no edge"
+    return f"{sel} ({odds}) {book} · {ev:+.1%} EV"
+
+def build_game_table(games: pd.DataFrame, picks_all: pd.DataFrame) -> pd.DataFrame:
+    """One row per game: model's predicted ML/spread side next to the best-EV
+    market pick for each, so you can see where the model's lean and the
+    recommended bet agree or diverge."""
+    if games is None or games.empty: return pd.DataFrame()
+    rows = []
+    for _, g in games.iterrows():
+        gid = g["game_id"]
+        gp = picks_all[picks_all["game_id"] == gid] if picks_all is not None else pd.DataFrame()
+        rows.append({
+            "week":              g.get("week"),
+            "kickoff":           g.get("kickoff"),
+            "matchup":           f"{g.get('away_team')} @ {g.get('home_team')}",
+            "model_ml_pick":     _model_ml_label(g.get("home_team"), g.get("away_team"), g.get("p_home")),
+            "ev_ml_pick":        _best_ev_label(gp[gp["market_key"].eq("moneyline")]),
+            "model_spread_pick": _model_spread_label(g.get("home_team"), g.get("away_team"), g.get("pred_margin")),
+            "ev_spread_pick":    _best_ev_label(gp[gp["market_key"].eq("spreads")]),
+        })
+    return pd.DataFrame(rows)
+
 # ---- ESPN-style pick cards ---------------------------------------------------
 
 _ESPN_LOGO_FIX = {"JAC": "jax", "WAS": "wsh"}
@@ -452,6 +498,7 @@ with tab_picks:
             })
             pred["home_pts"] = (pred["pred_total"] + pred["pred_margin"]) / 2.0
             pred["away_pts"] =  pred["pred_total"] - pred["home_pts"]
+            pred["p_home"]   = p_home
             pred["kickoff"] = ""
             pred["kickoff_dt"] = pd.NaT
             if "commence_dt" in game_feats.columns:
@@ -464,6 +511,7 @@ with tab_picks:
                     pass
 
             st.session_state["picks"] = picks_df_live
+            st.session_state["picks_all"] = picks_df_all
             st.session_state["pred_scores"] = pred
             st.session_state["last_diagnostics"] = {
                 "train_rows":           int(train_df["y_home_win"].notna().sum()),
@@ -522,6 +570,33 @@ with tab_picks:
         else:
             st.caption(f"Showing {shown['game_id'].nunique()} of {picks['game_id'].nunique()} games")
             render_espn_picks(shown, pred_all)
+
+        st.subheader("Moneyline & Spread — model pick vs. EV pick")
+        st.caption("For every game: the model's predicted side (win prob. / spread) next to the "
+                   "single best-EV market price for that side. Ignores the min-edge slider, so you "
+                   "can see a candidate even where it didn't clear the bettable threshold.")
+        if pred_all is not None and not pred_all.empty:
+            games_shown = filter_picks(
+                pred_all, slot_by_game,
+                week=int(wk_sel.split()[-1]) if wk_sel != "All weeks" else None,
+                conf=conf_sel if conf_sel != "All" else None,
+                div=div_sel if div_sel != "All" else None,
+                slot=slot_sel if slot_sel != "All times" else None,
+            )
+            game_table = build_game_table(games_shown, st.session_state.get("picks_all"))
+            st.dataframe(
+                game_table, use_container_width=True, hide_index=True,
+                column_config={
+                    "week":              st.column_config.NumberColumn("Wk"),
+                    "kickoff":           "Kickoff (ET)",
+                    "matchup":           "Matchup",
+                    "model_ml_pick":     "Model ML pick",
+                    "ev_ml_pick":        "EV ML pick",
+                    "model_spread_pick": "Model spread",
+                    "ev_spread_pick":    "EV spread pick",
+                },
+            )
+
         with st.expander(f"Table view (top {top_n} of filtered picks)", expanded=False):
             st.dataframe(pick_top(shown, top_n), use_container_width=True,
                          column_config=PICKS_COLUMN_CONFIG, hide_index=True)

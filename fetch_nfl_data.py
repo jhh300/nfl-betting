@@ -552,7 +552,12 @@ def prep_odds(df: pd.DataFrame) -> pd.DataFrame:
     out["is_over_outcome"] = out["outcome_name"].str.strip().str.lower().eq("over")
     out["odds_decimal"] = out["price_american"].map(lambda x: american_to_decimal(x) if pd.notna(x) else np.nan)
     out["book_p_raw"]   = out["price_american"].map(lambda x: implied_prob_from_american(x) if pd.notna(x) else np.nan)
-    grp_keys = ["odds_event_id","book_key","market_key"] + (["line"] if "line" in out.columns else [])
+    # NOTE: don't group by "line" — spread sides carry different lines
+    # (home -3.5 vs away +3.5), which would split each pair into its own
+    # size-1 group and make devig a no-op; h2h has no line at all, which
+    # would drop those rows from grouping entirely. Event+book+market alone
+    # already pairs the two opposing outcomes correctly for every market.
+    grp_keys = ["odds_event_id","book_key","market_key"]
     out["vig_sum"] = out.groupby(grp_keys)["book_p_raw"].transform("sum")
     out["book_p_devig"] = (out["book_p_raw"] / out["vig_sum"]).clip(lower=1e-6, upper=1-1e-6)
     return out

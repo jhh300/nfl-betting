@@ -201,59 +201,74 @@ def _pick_selection(r: pd.Series) -> str:
         return f"{team} {line:+g}" if pd.notna(line) else team
     return f"{'O' if side == 'OVER' else 'U'} {line:g}" if pd.notna(line) else str(side)
 
-def render_espn_picks(picks: pd.DataFrame, pred: pd.DataFrame | None) -> None:
-    """Render picks as ESPN-scoreboard-style game cards, best game first."""
+def render_espn_picks(games: pd.DataFrame, bettable: pd.DataFrame, pred: pd.DataFrame | None) -> None:
+    """Render one ESPN-scoreboard-style card per game in `games` (every
+    scheduled/odds-matched game), best-EV game first. `bettable` supplies the
+    pick rows for games that clear the edge/EV filter; a game with none still
+    gets a card — with a 'no qualifying edge' note — instead of disappearing,
+    so the grid always matches the full slate."""
     info = {}
     if pred is not None and not pred.empty:
         for _, g in pred.iterrows():
             info[g["game_id"]] = g
-    order = (picks.groupby("game_id")["ev_per_usd"].max()
-                  .sort_values(ascending=False).index.tolist())
+    ev_by_game = (bettable.groupby("game_id")["ev_per_usd"].max()
+                  if bettable is not None and not bettable.empty else pd.Series(dtype=float))
+    game_ids = games["game_id"].dropna().unique().tolist()
+    order = sorted(game_ids, key=lambda gid: -ev_by_game.get(gid, -np.inf))
     _market_order = {"moneyline": 0, "spreads": 1, "totals": 2}
     cards = []
     for gid in order:
-        all_rows = picks[picks["game_id"] == gid].sort_values("ev_per_usd", ascending=False)
-        # One line per market (best-priced book), so ML and spread both show
-        # instead of one market sweeping all slots because it has the best EV.
-        rows = (all_rows.drop_duplicates("market_key", keep="first")
-                        .assign(_ord=lambda d: d["market_key"].map(_market_order).fillna(9))
-                        .sort_values("_ord").drop(columns="_ord"))
-        n_more = len(all_rows) - len(rows)
-        r0 = rows.iloc[0]
-        home, away = r0.get("home_team", "?"), r0.get("away_team", "?")
         g = info.get(gid)
-        h_pts = f"{g['home_pts']:.0f}" if g is not None else ""
-        a_pts = f"{g['away_pts']:.0f}" if g is not None else ""
+        grow = games[games["game_id"] == gid].iloc[0]
+        home = g["home_team"] if g is not None else grow.get("home_team", "?")
+        away = g["away_team"] if g is not None else grow.get("away_team", "?")
+        h_pts = f"{g['home_pts']:.0f}" if g is not None and pd.notna(g.get("home_pts")) else ""
+        a_pts = f"{g['away_pts']:.0f}" if g is not None and pd.notna(g.get("away_pts")) else ""
         home_dim = " dim" if (g is not None and g["home_pts"] < g["away_pts"]) else ""
         away_dim = " dim" if (g is not None and g["away_pts"] <= g["home_pts"]) else ""
-        kick = str(r0.get("kickoff") or (g.get("kickoff") if g is not None else "") or "")
-        week = r0.get("week")
+        kick = str((g.get("kickoff") if g is not None else "") or grow.get("kickoff") or "")
+        week = g.get("week") if g is not None else grow.get("week")
         head_l = f"NFL{f' &bull; WEEK {int(week)}' if pd.notna(week) else ''}"
-        pick_rows = []
-        for _, r in rows.iterrows():
-            ev = pd.to_numeric(pd.Series([r.get("ev_per_usd")]), errors="coerce").iloc[0]
-            ev_cls = "pos" if pd.notna(ev) and ev > 0 else "neg"
-            ev_txt = f"{ev:+.1%} EV" if pd.notna(ev) else "—"
-            stake = pd.to_numeric(pd.Series([r.get("stake_usd")]), errors="coerce").iloc[0]
-            stake_txt = f"${stake:,.0f}" if pd.notna(stake) and stake > 0 else "—"
-            mkt = {"moneyline": "ML", "spreads": "Spread", "totals": "Total"}.get(r.get("market_key"), r.get("market_key"))
-            pick_rows.append(
-                f'<div class="espn-pick"><span class="mkt">{_esc(mkt)}</span>'
-                f'<span class="sel">{_esc(_pick_selection(r))}</span>'
-                f'<span class="odds">{_fmt_odds(r.get("odds_american"))}</span>'
-                f'<span class="book">{_esc(r.get("book_title") or "")}</span>'
-                f'<span class="ev {ev_cls}">{ev_txt}</span>'
-                f'<span class="stake">{stake_txt}</span></div>'
-            )
-        spread_rows = rows[rows["market_key"].eq("spreads")]
-        note_row = spread_rows.iloc[0] if not spread_rows.empty else rows.iloc[0]
-        note = ""
-        ml_val = pd.to_numeric(pd.Series([note_row.get("model_line")]), errors="coerce").iloc[0]
-        ep_val = pd.to_numeric(pd.Series([note_row.get("edge_pts")]), errors="coerce").iloc[0]
-        if pd.notna(ml_val) and pd.notna(ep_val):
-            note = f'<div class="espn-note">Model line {ml_val:+.1f} &bull; {ep_val:+.1f} pts vs book</div>'
-        if n_more > 0:
-            note += f'<div class="espn-note">+{n_more} more pick{"s" if n_more > 1 else ""} in table view</div>'
+
+        all_rows = (bettable[bettable["game_id"] == gid].sort_values("ev_per_usd", ascending=False)
+                    if bettable is not None and not bettable.empty else pd.DataFrame())
+        if all_rows.empty:
+            pick_rows_html = ('<div class="espn-note" style="padding:8px 12px 2px">'
+                               'No picks clear the edge/EV threshold for this game.</div>')
+            note = ""
+        else:
+            # One line per market (best-priced book), so ML and spread both
+            # show instead of one market sweeping all slots on raw EV.
+            rows = (all_rows.drop_duplicates("market_key", keep="first")
+                            .assign(_ord=lambda d: d["market_key"].map(_market_order).fillna(9))
+                            .sort_values("_ord").drop(columns="_ord"))
+            n_more = len(all_rows) - len(rows)
+            pick_rows = []
+            for _, r in rows.iterrows():
+                ev = pd.to_numeric(pd.Series([r.get("ev_per_usd")]), errors="coerce").iloc[0]
+                ev_cls = "pos" if pd.notna(ev) and ev > 0 else "neg"
+                ev_txt = f"{ev:+.1%} EV" if pd.notna(ev) else "—"
+                stake = pd.to_numeric(pd.Series([r.get("stake_usd")]), errors="coerce").iloc[0]
+                stake_txt = f"${stake:,.0f}" if pd.notna(stake) and stake > 0 else "—"
+                mkt = {"moneyline": "ML", "spreads": "Spread", "totals": "Total"}.get(r.get("market_key"), r.get("market_key"))
+                pick_rows.append(
+                    f'<div class="espn-pick"><span class="mkt">{_esc(mkt)}</span>'
+                    f'<span class="sel">{_esc(_pick_selection(r))}</span>'
+                    f'<span class="odds">{_fmt_odds(r.get("odds_american"))}</span>'
+                    f'<span class="book">{_esc(r.get("book_title") or "")}</span>'
+                    f'<span class="ev {ev_cls}">{ev_txt}</span>'
+                    f'<span class="stake">{stake_txt}</span></div>'
+                )
+            pick_rows_html = "".join(pick_rows)
+            spread_rows = rows[rows["market_key"].eq("spreads")]
+            note_row = spread_rows.iloc[0] if not spread_rows.empty else rows.iloc[0]
+            note = ""
+            ml_val = pd.to_numeric(pd.Series([note_row.get("model_line")]), errors="coerce").iloc[0]
+            ep_val = pd.to_numeric(pd.Series([note_row.get("edge_pts")]), errors="coerce").iloc[0]
+            if pd.notna(ml_val) and pd.notna(ep_val):
+                note = f'<div class="espn-note">Model line {ml_val:+.1f} &bull; {ep_val:+.1f} pts vs book</div>'
+            if n_more > 0:
+                note += f'<div class="espn-note">+{n_more} more pick{"s" if n_more > 1 else ""} in table view</div>'
         cards.append(
             f'<div class="espn-card">'
             f'<div class="espn-head"><span>{head_l}</span><span>{_esc(kick)}</span></div>'
@@ -261,7 +276,7 @@ def render_espn_picks(picks: pd.DataFrame, pred: pd.DataFrame | None) -> None:
             f'<span class="abbr">{_esc(away)}</span><span class="sub">Away</span><span class="proj">{a_pts}</span></div>'
             f'<div class="espn-team{home_dim}"><img src="{_esc(_logo_url(home))}"/>'
             f'<span class="abbr">{_esc(home)}</span><span class="sub">Home</span><span class="proj">{h_pts}</span></div>'
-            f'<div class="espn-picks">{"".join(pick_rows)}</div>{note}'
+            f'<div class="espn-picks">{pick_rows_html}</div>{note}'
             f'</div>'
         )
     st.markdown(_ESPN_CSS + f'<div class="espn-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
@@ -548,9 +563,12 @@ with tab_picks:
         if pred_all is not None and "kickoff_dt" in pred_all.columns:
             slot_by_game = {g: _time_slot(t) for g, t in zip(pred_all["game_id"], pred_all["kickoff_dt"])}
 
-        # Filter bar — week defaults to the current (earliest upcoming) week
+        # Filter bar — week defaults to the current (earliest upcoming) week.
+        # Options come from the full game list (pred_all), not just games with
+        # a bettable pick, so a week with zero qualifying edges is still pickable.
+        week_source = pred_all if pred_all is not None and not pred_all.empty else picks
         c1, c2, c3, c4 = st.columns(4)
-        weeks = sorted(pd.to_numeric(picks["week"], errors="coerce").dropna().astype(int).unique())
+        weeks = sorted(pd.to_numeric(week_source["week"], errors="coerce").dropna().astype(int).unique())
         wk_sel   = c1.selectbox("Week", ["All weeks"] + [f"Week {w}" for w in weeks],
                                 index=1 if weeks else 0, key="flt_week")
         conf_sel = c2.selectbox("Conference", ["All", "AFC", "NFC"], key="flt_conf")
@@ -558,31 +576,31 @@ with tab_picks:
         slots_present = [s for s in TIME_SLOTS if s in set(slot_by_game.values())]
         slot_sel = c4.selectbox("Kickoff (ET)", ["All times"] + slots_present, key="flt_slot")
 
-        shown = filter_picks(
-            picks, slot_by_game,
+        _flt = dict(
             week=int(wk_sel.split()[-1]) if wk_sel != "All weeks" else None,
             conf=conf_sel if conf_sel != "All" else None,
             div=div_sel if div_sel != "All" else None,
             slot=slot_sel if slot_sel != "All times" else None,
         )
-        if shown.empty:
+        # Every scheduled/odds-matched game in the filtered range gets a card —
+        # not just games with a bettable pick, so a game with no qualifying
+        # edge (e.g. today's board with EV too thin) still shows up.
+        games_shown = filter_picks(pred_all, slot_by_game, **_flt) if pred_all is not None and not pred_all.empty else pd.DataFrame()
+        shown = filter_picks(picks, slot_by_game, **_flt)
+        if games_shown.empty and shown.empty:
             st.info("No games match the selected filters.")
         else:
-            st.caption(f"Showing {shown['game_id'].nunique()} of {picks['game_id'].nunique()} games")
-            render_espn_picks(shown, pred_all)
+            total_games = pred_all["game_id"].nunique() if pred_all is not None and not pred_all.empty else picks["game_id"].nunique()
+            n_shown = games_shown["game_id"].nunique() if not games_shown.empty else shown["game_id"].nunique()
+            st.caption(f"Showing {n_shown} of {total_games} games "
+                       f"({shown['game_id'].nunique()} with a pick clearing the edge/EV filter)")
+            render_espn_picks(games_shown if not games_shown.empty else shown, shown, pred_all)
 
         st.subheader("Moneyline & Spread — model pick vs. EV pick")
         st.caption("For every game: the model's predicted side (win prob. / spread) next to the "
                    "single best-EV market price for that side. Ignores the min-edge slider, so you "
                    "can see a candidate even where it didn't clear the bettable threshold.")
-        if pred_all is not None and not pred_all.empty:
-            games_shown = filter_picks(
-                pred_all, slot_by_game,
-                week=int(wk_sel.split()[-1]) if wk_sel != "All weeks" else None,
-                conf=conf_sel if conf_sel != "All" else None,
-                div=div_sel if div_sel != "All" else None,
-                slot=slot_sel if slot_sel != "All times" else None,
-            )
+        if not games_shown.empty:
             game_table = build_game_table(games_shown, st.session_state.get("picks_all"))
             st.dataframe(
                 game_table, use_container_width=True, hide_index=True,

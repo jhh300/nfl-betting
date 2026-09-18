@@ -878,60 +878,104 @@ def run_backtest(sched_all: pd.DataFrame, weekly_all: pd.DataFrame, eval_seasons
 
 # ---- Season-to-date tracker: predicted winner vs actual winner ---------------
 
-def summarize_season_to_date(bt_df: pd.DataFrame, ml_stake: float = 10.0) -> dict:
-    """Straight-up predicted-winner-vs-actual-winner record for every completed
-    game in a walk-forward backtest (see run_backtest / TRAIN_WINDOW_SEASONS —
-    each prediction only ever uses data available before that game was played,
-    so this mirrors what the model would have said at kickoff). Not a betting
-    record in the EV/edge sense — just "did the model pick the right team" —
-    but also includes what a flat `ml_stake` moneyline bet on that predicted
-    winner, every single game, would have paid at the real closing price.
-    """
-    if bt_df is None or bt_df.empty:
-        return {}
-    d = bt_df.copy()
-    d["week"] = pd.to_numeric(d["week"], errors="coerce")
-    d["pred_winner"]   = np.where(d["p_home_pred"] > 0.5, d["home_team"], d["away_team"])
-    d["actual_winner"] = np.where(d["actual_home_win"] == 1, d["home_team"], d["away_team"])
-    d["correct"] = d["pred_winner"] == d["actual_winner"]
-    d["home_score"] = (d["actual_total"] + d["actual_margin"]) / 2.0
-    d["away_score"] =  d["actual_total"] - d["home_score"]
-
-    for c in ["home_moneyline", "away_moneyline"]:
-        if c not in d.columns: d[c] = np.nan
-    d["ml_price"] = np.where(d["pred_winner"] == d["home_team"], d["home_moneyline"], d["away_moneyline"])
-    dec = pd.to_numeric(d["ml_price"], errors="coerce").map(
+def _flat_bet_block(d: pd.DataFrame, correct: pd.Series, push, price_col: str, stake: float) -> dict:
+    """Shared shape for a flat-stake tracker: win/loss/push record, $ P&L at
+    the real closing price, weekly breakdown, and per-game detail. `correct`
+    is a bool Series aligned to `d` (True = pick won outright); `push` is a
+    bool Series aligned to `d`, or None (spreads/totals can push, ML can't)."""
+    correct = pd.Series(correct, index=d.index).astype(bool)
+    push = pd.Series(push, index=d.index).astype(bool) if push is not None else pd.Series(False, index=d.index)
+    dec = pd.to_numeric(d[price_col], errors="coerce").map(
         lambda a: american_to_decimal(a) if pd.notna(a) else np.nan)
-    d["bet_pl"] = np.where(dec.notna(), np.where(d["correct"], ml_stake * (dec - 1.0), -ml_stake), np.nan)
+    d = d.copy()
+    d["result"] = np.select([push, correct], ["push", "win"], default="loss")
+    d["bet_pl"] = np.where(dec.notna(), np.where(push, 0.0, np.where(correct, stake * (dec - 1.0), -stake)), np.nan)
 
     n = int(len(d))
-    correct = int(d["correct"].sum())
+    wins    = int((d["result"] == "win").sum())
+    losses  = int((d["result"] == "loss").sum())
+    pushes  = int((d["result"] == "push").sum())
     n_priced = int(dec.notna().sum())
     total_pl = float(d["bet_pl"].sum(skipna=True))
 
-    weekly = (d.groupby("week", as_index=False)
-                .agg(games=("game_id", "count"), correct=("correct", "sum"),
-                     pl=("bet_pl", lambda s: s.sum(skipna=True))))
-    weekly["record"]   = weekly.apply(lambda r: f"{int(r['correct'])}-{int(r['games']-r['correct'])}", axis=1)
-    weekly["accuracy"] = weekly["correct"] / weekly["games"]
-
-    keep = ["week","game_id","home_team","away_team","home_score","away_score",
-            "p_home_pred","pred_winner","actual_winner","correct","pred_margin","actual_margin",
-            "ml_price","bet_pl"]
-    per_game = d[[c for c in keep if c in d.columns]].sort_values(["week","game_id"]).reset_index(drop=True)
+    weekly = d.groupby("week").apply(
+        lambda g: pd.Series({
+            "games":  len(g),
+            "wins":   int((g["result"]=="win").sum()),
+            "losses": int((g["result"]=="loss").sum()),
+            "pushes": int((g["result"]=="push").sum()),
+            "pl":     float(g["bet_pl"].sum(skipna=True)),
+        })
+    ).reset_index()
+    weekly["record"]   = weekly.apply(lambda r: f"{int(r['wins'])}-{int(r['losses'])}"
+                                       + (f"-{int(r['pushes'])}" if r["pushes"] else ""), axis=1)
+    weekly["accuracy"] = weekly["wins"] / (weekly["wins"] + weekly["losses"]).replace(0, np.nan)
 
     return {
-        "n_games":     n,
-        "correct":     correct,
-        "incorrect":   n - correct,
-        "accuracy":    (correct / n) if n else np.nan,
-        "ml_stake":    ml_stake,
-        "n_priced":    n_priced,
-        "total_pl":    total_pl,
-        "roi":         (total_pl / (n_priced * ml_stake)) if n_priced else np.nan,
-        "weekly":      weekly,
-        "per_game":    per_game,
+        "n_games":  n, "wins": wins, "losses": losses, "pushes": pushes,
+        "accuracy": (wins / (wins + losses)) if (wins + losses) else np.nan,
+        "stake": stake, "n_priced": n_priced, "total_pl": total_pl,
+        "roi": (total_pl / (n_priced * stake)) if n_priced else np.nan,
+        "weekly": weekly, "d": d,
     }
+
+def summarize_season_to_date(bt_df: pd.DataFrame, ml_stake: float = 10.0, spread_stake: float = 10.0) -> dict:
+    """Two independent flat-stake trackers for every completed game this
+    season (walk-forward, in-season retraining — each prediction only ever
+    used data available before that game was played, mirroring what the
+    model would have said at kickoff):
+
+      "moneyline" — bet `ml_stake` on the model's predicted winner, every
+                    game, at the real closing moneyline price.
+      "spread"    — bet `spread_stake` on whichever side of the real closing
+                    spread the model's predicted margin favors, at the real
+                    closing spread price. Can push.
+
+    Kept as two separate blocks (not merged into one record) since a game's
+    ML and ATS picks are graded independently and can disagree.
+    """
+    if bt_df is None or bt_df.empty:
+        return {}
+    base = bt_df.copy()
+    base["week"] = pd.to_numeric(base["week"], errors="coerce")
+    base["home_score"] = (base["actual_total"] + base["actual_margin"]) / 2.0
+    base["away_score"] =  base["actual_total"] - base["home_score"]
+    for c in ["home_moneyline","away_moneyline","home_spread_odds","away_spread_odds","vegas_spread"]:
+        if c not in base.columns: base[c] = np.nan
+
+    # --- Moneyline: pick = model's predicted winner ---
+    ml = base.copy()
+    ml["pred_winner"]   = np.where(ml["p_home_pred"] > 0.5, ml["home_team"], ml["away_team"])
+    ml["actual_winner"] = np.where(ml["actual_home_win"] == 1, ml["home_team"], ml["away_team"])
+    ml["_correct"] = ml["pred_winner"] == ml["actual_winner"]
+    ml["ml_price"] = np.where(ml["pred_winner"] == ml["home_team"], ml["home_moneyline"], ml["away_moneyline"])
+    ml_block = _flat_bet_block(ml, ml["_correct"], None, "ml_price", ml_stake)
+    ml_pg = ml_block.pop("d")
+    ml_pg = ml_pg.rename(columns={"result": "ml_result"})
+    ml_keep = ["week","game_id","home_team","away_team","home_score","away_score",
+               "p_home_pred","pred_winner","actual_winner","ml_result","ml_price","bet_pl"]
+    ml_block["per_game"] = ml_pg[[c for c in ml_keep if c in ml_pg.columns]].sort_values(["week","game_id"]).reset_index(drop=True)
+    ml_block["ml_stake"] = ml_block.pop("stake")
+
+    # --- Spread: pick = side the model's margin favors vs the closing line ---
+    sp = base[base["vegas_spread"].notna() & base["actual_margin"].notna()].copy()
+    sp["edge_pts"] = sp["pred_margin"] - sp["vegas_spread"]
+    sp["side"] = np.where(sp["edge_pts"] >= 0, "HOME", "AWAY")
+    home_covered = sp["actual_margin"] > sp["vegas_spread"]
+    push = sp["actual_margin"] == sp["vegas_spread"]
+    sp["_correct"] = np.where(sp["side"] == "HOME", home_covered, ~home_covered)
+    sp["spread_price"] = np.where(sp["side"] == "HOME", sp["home_spread_odds"], sp["away_spread_odds"])
+    spread_block = _flat_bet_block(sp, sp["_correct"], push, "spread_price", spread_stake)
+    sp_pg = spread_block.pop("d")
+    sp_pg = sp_pg.rename(columns={"result": "ats_result"})
+    sp_pg["picked_team"] = np.where(sp_pg["side"] == "HOME", sp_pg["home_team"], sp_pg["away_team"])
+    sp_pg["model_line"]  = np.where(sp_pg["side"] == "HOME", -sp_pg["pred_margin"], sp_pg["pred_margin"])
+    sp_keep = ["week","game_id","home_team","away_team","home_score","away_score",
+               "vegas_spread","side","picked_team","actual_margin","ats_result","spread_price","bet_pl"]
+    spread_block["per_game"] = sp_pg[[c for c in sp_keep if c in sp_pg.columns]].sort_values(["week","game_id"]).reset_index(drop=True)
+    spread_block["spread_stake"] = spread_block.pop("stake")
+
+    return {"moneyline": ml_block, "spread": spread_block}
 
 # ---- Model vs Vegas performance tracking -------------------------------------
 

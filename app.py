@@ -644,79 +644,99 @@ with tab_picks:
 # ============================================================================
 # TAB 2: SEASON TRACKER — predicted winner vs actual winner, this season
 # ============================================================================
+
+def _render_flat_bet_block(block: dict, label: str, stake_key: str, price_label: str,
+                           per_game_cols: list, csv_name: str) -> None:
+    """Render one flat-stake tracker block (moneyline OR spread) as its own
+    self-contained section: metrics, weekly table, game-by-game expander."""
+    stake = block.get(stake_key, 10.0)
+    st.markdown(f"#### {label}")
+    if not block.get("n_games"):
+        st.info(f"No {label.lower()} games available.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Record (W-L-P)" if block.get("pushes") else "Record (W-L)",
+              f"{block['wins']}-{block['losses']}" + (f"-{block['pushes']}" if block.get("pushes") else ""))
+    c2.metric("Win %", f"{block['accuracy']:.1%}" if pd.notna(block['accuracy']) else "—")
+    c3.metric("Games", block["n_games"])
+    c4.metric(f"${stake:g} bet every game", f"{block['total_pl']:+.2f}",
+              delta=f"{block['roi']:+.1%} ROI on {block['n_priced']} priced games" if block['n_priced'] else "no odds available",
+              delta_color="off")
+
+    st.dataframe(
+        block["weekly"][["week","record","accuracy","games","pl"]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "week":     st.column_config.NumberColumn("Week"),
+            "record":   "Record",
+            "accuracy": st.column_config.NumberColumn("Win %", format="percent"),
+            "games":    st.column_config.NumberColumn("Games"),
+            "pl":       st.column_config.NumberColumn(f"${stake:g}/game P&L", format="dollar"),
+        },
+    )
+    with st.expander(f"{label} — game-by-game", expanded=False):
+        pg = block["per_game"]
+        cfg = {
+            "week":         st.column_config.NumberColumn("Week"),
+            "home_score":   st.column_config.NumberColumn("Home pts", format="%.0f"),
+            "away_score":   st.column_config.NumberColumn("Away pts", format="%.0f"),
+            "p_home_pred":  st.column_config.NumberColumn("Model P(home win)", format="percent"),
+            "vegas_spread": st.column_config.NumberColumn("Closing spread (home)", format="%.1f"),
+            "actual_margin": st.column_config.NumberColumn("Actual margin", format="%.0f"),
+            "ml_price":     st.column_config.NumberColumn(price_label, format="%+d"),
+            "spread_price": st.column_config.NumberColumn(price_label, format="%+d"),
+            "bet_pl":       st.column_config.NumberColumn(f"${stake:g} bet P&L", format="dollar"),
+        }
+        st.dataframe(pg[[c for c in per_game_cols if c in pg.columns]], use_container_width=True,
+                     hide_index=True, column_config=cfg)
+        st.download_button(f"Download {label.lower()} tracker CSV", pg.to_csv(index=False),
+                           csv_name, "text/csv", key=f"dl_{stake_key}")
+
 with tab_tracker:
-    st.subheader("Season-to-Date: Predicted Winner vs Actual Winner")
+    st.subheader("Season-to-Date Tracker")
     st.caption(
-        "Straight-up record for every completed game this season — 'did the model pick the right team,' "
-        "plus what a flat moneyline bet on that predicted winner would have paid at the real closing price. "
-        "Predictions are computed walk-forward with in-season retraining every 4 weeks (same process live "
-        "picks use), so each game's prediction only ever used data available before that game was played."
+        "Two independent trackers for every completed game this season: moneyline (predicted winner) "
+        "and against-the-spread (predicted side of the closing line), each with its own flat-stake $ P&L "
+        "at the real closing price. Kept separate since a game's ML and ATS picks can disagree. Predictions "
+        "are computed walk-forward with in-season retraining (same process live picks use), so each game's "
+        "prediction only ever used data available before it was played."
     )
     current_year = int(utc_now_year())
-    c_season, c_stake = st.columns(2)
-    st_season = c_season.number_input("Season", min_value=2000, max_value=2100, value=current_year, step=1, key="st_season")
-    st_stake  = c_stake.number_input("Moneyline bet size ($)", min_value=1.0, value=10.0, step=1.0, key="st_stake")
+    c_season, c_ml_stake, c_sp_stake = st.columns(3)
+    st_season   = c_season.number_input("Season", min_value=2000, max_value=2100, value=current_year, step=1, key="st_season")
+    st_ml_stake = c_ml_stake.number_input("Moneyline bet size ($)", min_value=1.0, value=10.0, step=1.0, key="st_ml_stake")
+    st_sp_stake = c_sp_stake.number_input("Spread bet size ($)", min_value=1.0, value=10.0, step=1.0, key="st_sp_stake")
 
     if st.button("Refresh Season Tracker", type="primary"):
         try:
             bt = backtest_for([int(st_season)])
-            st.session_state["season_tracker"] = fn.summarize_season_to_date(bt, ml_stake=float(st_stake))
+            st.session_state["season_tracker"] = fn.summarize_season_to_date(
+                bt, ml_stake=float(st_ml_stake), spread_stake=float(st_sp_stake))
             st.session_state["season_tracker_season"] = int(st_season)
         except Exception as e:
             st.error(f"Season tracker failed: {e}")
             st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
-    summary = st.session_state.get("season_tracker")
-    if summary is None:
+    tracker = st.session_state.get("season_tracker")
+    if tracker is None:
         st.info("Click **Refresh Season Tracker** to compute this season's record.")
-    elif not summary.get("n_games"):
+    elif not tracker.get("moneyline", {}).get("n_games") and not tracker.get("spread", {}).get("n_games"):
         st.info(f"No completed games found for season {st.session_state.get('season_tracker_season', int(st_season))} yet.")
     else:
-        stake = summary.get("ml_stake", 10.0)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Record (correct-incorrect)", f"{summary['correct']}-{summary['incorrect']}")
-        c2.metric("Accuracy", f"{summary['accuracy']:.1%}")
-        c3.metric("Games completed", summary["n_games"])
-        c4.metric(f"${stake:g} ML bet every game", f"{summary['total_pl']:+.2f}",
-                  delta=f"{summary['roi']:+.1%} ROI on {summary['n_priced']} priced games" if summary['n_priced'] else "no odds available",
-                  delta_color="off")
-
-        st.markdown("#### By week")
-        st.dataframe(
-            summary["weekly"][["week","record","accuracy","games","pl"]],
-            use_container_width=True, hide_index=True,
-            column_config={
-                "week":     st.column_config.NumberColumn("Week"),
-                "record":   "Record",
-                "accuracy": st.column_config.NumberColumn("Accuracy", format="percent"),
-                "games":    st.column_config.NumberColumn("Games"),
-                "pl":       st.column_config.NumberColumn(f"${stake:g}/game P&L", format="dollar"),
-            },
+        yr = st.session_state.get('season_tracker_season', int(st_season))
+        _render_flat_bet_block(
+            tracker.get("moneyline", {}), "Moneyline", "ml_stake", "ML price",
+            ["week","home_team","away_team","home_score","away_score",
+             "p_home_pred","pred_winner","actual_winner","ml_result","ml_price","bet_pl"],
+            f"season_tracker_moneyline_{yr}.csv",
         )
-
-        with st.expander("Game-by-game", expanded=False):
-            pg = summary["per_game"].copy()
-            pg["result"] = np.where(pg["correct"], "✅", "❌")
-            show_cols = ["week","home_team","away_team","home_score","away_score",
-                        "p_home_pred","pred_winner","actual_winner","result","ml_price","bet_pl"]
-            st.dataframe(
-                pg[[c for c in show_cols if c in pg.columns]],
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "week":         st.column_config.NumberColumn("Week"),
-                    "home_score":   st.column_config.NumberColumn("Home pts", format="%.0f"),
-                    "away_score":   st.column_config.NumberColumn("Away pts", format="%.0f"),
-                    "p_home_pred":  st.column_config.NumberColumn("Model P(home win)", format="percent"),
-                    "pred_winner":  "Predicted winner",
-                    "actual_winner": "Actual winner",
-                    "result":       "",
-                    "ml_price":     st.column_config.NumberColumn("ML price", format="%+d"),
-                    "bet_pl":       st.column_config.NumberColumn(f"${stake:g} bet P&L", format="dollar"),
-                },
-            )
-            st.download_button("Download season tracker CSV", summary["per_game"].to_csv(index=False),
-                               f"season_tracker_{st.session_state.get('season_tracker_season', int(st_season))}.csv",
-                               "text/csv")
+        st.divider()
+        _render_flat_bet_block(
+            tracker.get("spread", {}), "Against the Spread", "spread_stake", "Spread price",
+            ["week","home_team","away_team","vegas_spread","picked_team","actual_margin",
+             "ats_result","spread_price","bet_pl"],
+            f"season_tracker_spread_{yr}.csv",
+        )
 
 # ============================================================================
 # TAB 3: MODEL vs VEGAS

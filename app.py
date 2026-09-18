@@ -403,7 +403,8 @@ with st.sidebar.expander("Optional team metrics CSVs"):
 
 st.title("NFL Picks")
 
-tab_picks, tab_vegas, tab_backtest, tab_diag = st.tabs(["Picks", "Model vs Vegas", "Backtest", "Diagnostics"])
+tab_picks, tab_tracker, tab_vegas, tab_backtest, tab_diag = st.tabs(
+    ["Picks", "Season Tracker", "Model vs Vegas", "Backtest", "Diagnostics"])
 
 # ============================================================================
 # TAB 1: PICKS
@@ -641,7 +642,75 @@ with tab_picks:
                                             for c in ["home_pts","away_pts","pred_total","pred_margin"]})
 
 # ============================================================================
-# TAB 2: MODEL vs VEGAS
+# TAB 2: SEASON TRACKER — predicted winner vs actual winner, this season
+# ============================================================================
+with tab_tracker:
+    st.subheader("Season-to-Date: Predicted Winner vs Actual Winner")
+    st.caption(
+        "Straight-up record for every completed game this season — not a betting record, just "
+        "'did the model pick the right team.' Predictions are computed walk-forward with in-season "
+        "retraining every 4 weeks (same process live picks use), so each game's prediction only ever "
+        "used data available before that game was played."
+    )
+    current_year = int(utc_now_year())
+    st_season = st.number_input("Season", min_value=2000, max_value=2100, value=current_year, step=1, key="st_season")
+
+    if st.button("Refresh Season Tracker", type="primary"):
+        try:
+            bt = backtest_for([int(st_season)])
+            st.session_state["season_tracker"] = fn.summarize_season_to_date(bt)
+            st.session_state["season_tracker_season"] = int(st_season)
+        except Exception as e:
+            st.error(f"Season tracker failed: {e}")
+            st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+
+    summary = st.session_state.get("season_tracker")
+    if summary is None:
+        st.info("Click **Refresh Season Tracker** to compute this season's record.")
+    elif not summary.get("n_games"):
+        st.info(f"No completed games found for season {st.session_state.get('season_tracker_season', int(st_season))} yet.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Record (correct-incorrect)", f"{summary['correct']}-{summary['incorrect']}")
+        c2.metric("Accuracy", f"{summary['accuracy']:.1%}")
+        c3.metric("Games completed", summary["n_games"])
+
+        st.markdown("#### By week")
+        st.dataframe(
+            summary["weekly"][["week","record","accuracy","games"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "week":     st.column_config.NumberColumn("Week"),
+                "record":   "Record",
+                "accuracy": st.column_config.NumberColumn("Accuracy", format="percent"),
+                "games":    st.column_config.NumberColumn("Games"),
+            },
+        )
+
+        with st.expander("Game-by-game", expanded=False):
+            pg = summary["per_game"].copy()
+            pg["result"] = np.where(pg["correct"], "✅", "❌")
+            show_cols = ["week","home_team","away_team","home_score","away_score",
+                        "p_home_pred","pred_winner","actual_winner","result"]
+            st.dataframe(
+                pg[[c for c in show_cols if c in pg.columns]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "week":         st.column_config.NumberColumn("Week"),
+                    "home_score":   st.column_config.NumberColumn("Home pts", format="%.0f"),
+                    "away_score":   st.column_config.NumberColumn("Away pts", format="%.0f"),
+                    "p_home_pred":  st.column_config.NumberColumn("Model P(home win)", format="percent"),
+                    "pred_winner":  "Predicted winner",
+                    "actual_winner": "Actual winner",
+                    "result":       "",
+                },
+            )
+            st.download_button("Download season tracker CSV", summary["per_game"].to_csv(index=False),
+                               f"season_tracker_{st.session_state.get('season_tracker_season', int(st_season))}.csv",
+                               "text/csv")
+
+# ============================================================================
+# TAB 3: MODEL vs VEGAS
 # ============================================================================
 with tab_vegas:
     st.subheader("Model vs Vegas Closing Lines")
@@ -735,7 +804,7 @@ with tab_vegas:
                                "model_vs_vegas.csv", "text/csv")
 
 # ============================================================================
-# TAB 3: BACKTEST
+# TAB 4: BACKTEST
 # ============================================================================
 with tab_backtest:
     st.subheader("Walk-Forward Backtest")
@@ -805,7 +874,7 @@ with tab_backtest:
             st.dataframe(bt_df, use_container_width=True, hide_index=True)
 
 # ============================================================================
-# TAB 4: DIAGNOSTICS
+# TAB 5: DIAGNOSTICS
 # ============================================================================
 with tab_diag:
     st.subheader("Model Diagnostics")

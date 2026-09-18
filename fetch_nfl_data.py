@@ -375,17 +375,21 @@ def build_game_features(sched: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFra
     return feats
 
 def make_training_set(feats_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds y_home_win/y_margin/y_total, NaN for any game without a final
+    score. Must be computed per-row: a frame mixing played and unplayed games
+    (e.g. this season's completed weeks next to its future schedule) is the
+    normal case, not the exception — `hs > as_` on NaN scores evaluates to
+    False rather than NaN, so an any-completed-anywhere check would wrongly
+    label every future game a "away team won" result."""
     df = feats_df.copy()
     for c in ["home_score","away_score"]:
         if c not in df: df[c] = np.nan
-    if df["home_score"].notna().any() and df["away_score"].notna().any():
-        hs  = pd.to_numeric(df["home_score"], errors="coerce")
-        as_ = pd.to_numeric(df["away_score"], errors="coerce")
-        df["y_home_win"] = (hs > as_).astype(int)
-        df["y_margin"]   = hs - as_
-        df["y_total"]    = hs + as_
-    else:
-        df["y_home_win"] = np.nan; df["y_margin"] = np.nan; df["y_total"] = np.nan
+    hs  = pd.to_numeric(df["home_score"], errors="coerce")
+    as_ = pd.to_numeric(df["away_score"], errors="coerce")
+    played = hs.notna() & as_.notna()
+    df["y_home_win"] = np.where(played, (hs > as_).astype(float), np.nan)
+    df["y_margin"]   = np.where(played, hs - as_, np.nan)
+    df["y_total"]    = np.where(played, hs + as_, np.nan)
     return df
 
 # ---- Fallback models --------------------------------------------------------
@@ -871,6 +875,45 @@ def run_backtest(sched_all: pd.DataFrame, weekly_all: pd.DataFrame, eval_seasons
     if not results:
         return pd.DataFrame()
     return pd.concat(results, ignore_index=True)
+
+# ---- Season-to-date tracker: predicted winner vs actual winner ---------------
+
+def summarize_season_to_date(bt_df: pd.DataFrame) -> dict:
+    """Straight-up predicted-winner-vs-actual-winner record for every completed
+    game in a walk-forward backtest (see run_backtest / TRAIN_WINDOW_SEASONS —
+    each prediction only ever uses data available before that game was played,
+    so this mirrors what the model would have said at kickoff). Not a betting
+    record — no odds/EV involved, just "did the model pick the right team."
+    """
+    if bt_df is None or bt_df.empty:
+        return {}
+    d = bt_df.copy()
+    d["week"] = pd.to_numeric(d["week"], errors="coerce")
+    d["pred_winner"]   = np.where(d["p_home_pred"] > 0.5, d["home_team"], d["away_team"])
+    d["actual_winner"] = np.where(d["actual_home_win"] == 1, d["home_team"], d["away_team"])
+    d["correct"] = d["pred_winner"] == d["actual_winner"]
+    d["home_score"] = (d["actual_total"] + d["actual_margin"]) / 2.0
+    d["away_score"] =  d["actual_total"] - d["home_score"]
+
+    n = int(len(d))
+    correct = int(d["correct"].sum())
+    weekly = (d.groupby("week", as_index=False)
+                .agg(games=("game_id", "count"), correct=("correct", "sum")))
+    weekly["record"]   = weekly.apply(lambda r: f"{int(r['correct'])}-{int(r['games']-r['correct'])}", axis=1)
+    weekly["accuracy"] = weekly["correct"] / weekly["games"]
+
+    keep = ["week","game_id","home_team","away_team","home_score","away_score",
+            "p_home_pred","pred_winner","actual_winner","correct","pred_margin","actual_margin"]
+    per_game = d[[c for c in keep if c in d.columns]].sort_values(["week","game_id"]).reset_index(drop=True)
+
+    return {
+        "n_games":   n,
+        "correct":   correct,
+        "incorrect": n - correct,
+        "accuracy":  (correct / n) if n else np.nan,
+        "weekly":    weekly,
+        "per_game":  per_game,
+    }
 
 # ---- Model vs Vegas performance tracking -------------------------------------
 

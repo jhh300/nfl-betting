@@ -647,18 +647,20 @@ with tab_picks:
 with tab_tracker:
     st.subheader("Season-to-Date: Predicted Winner vs Actual Winner")
     st.caption(
-        "Straight-up record for every completed game this season — not a betting record, just "
-        "'did the model pick the right team.' Predictions are computed walk-forward with in-season "
-        "retraining every 4 weeks (same process live picks use), so each game's prediction only ever "
-        "used data available before that game was played."
+        "Straight-up record for every completed game this season — 'did the model pick the right team,' "
+        "plus what a flat moneyline bet on that predicted winner would have paid at the real closing price. "
+        "Predictions are computed walk-forward with in-season retraining every 4 weeks (same process live "
+        "picks use), so each game's prediction only ever used data available before that game was played."
     )
     current_year = int(utc_now_year())
-    st_season = st.number_input("Season", min_value=2000, max_value=2100, value=current_year, step=1, key="st_season")
+    c_season, c_stake = st.columns(2)
+    st_season = c_season.number_input("Season", min_value=2000, max_value=2100, value=current_year, step=1, key="st_season")
+    st_stake  = c_stake.number_input("Moneyline bet size ($)", min_value=1.0, value=10.0, step=1.0, key="st_stake")
 
     if st.button("Refresh Season Tracker", type="primary"):
         try:
             bt = backtest_for([int(st_season)])
-            st.session_state["season_tracker"] = fn.summarize_season_to_date(bt)
+            st.session_state["season_tracker"] = fn.summarize_season_to_date(bt, ml_stake=float(st_stake))
             st.session_state["season_tracker_season"] = int(st_season)
         except Exception as e:
             st.error(f"Season tracker failed: {e}")
@@ -670,20 +672,25 @@ with tab_tracker:
     elif not summary.get("n_games"):
         st.info(f"No completed games found for season {st.session_state.get('season_tracker_season', int(st_season))} yet.")
     else:
-        c1, c2, c3 = st.columns(3)
+        stake = summary.get("ml_stake", 10.0)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Record (correct-incorrect)", f"{summary['correct']}-{summary['incorrect']}")
         c2.metric("Accuracy", f"{summary['accuracy']:.1%}")
         c3.metric("Games completed", summary["n_games"])
+        c4.metric(f"${stake:g} ML bet every game", f"{summary['total_pl']:+.2f}",
+                  delta=f"{summary['roi']:+.1%} ROI on {summary['n_priced']} priced games" if summary['n_priced'] else "no odds available",
+                  delta_color="off")
 
         st.markdown("#### By week")
         st.dataframe(
-            summary["weekly"][["week","record","accuracy","games"]],
+            summary["weekly"][["week","record","accuracy","games","pl"]],
             use_container_width=True, hide_index=True,
             column_config={
                 "week":     st.column_config.NumberColumn("Week"),
                 "record":   "Record",
                 "accuracy": st.column_config.NumberColumn("Accuracy", format="percent"),
                 "games":    st.column_config.NumberColumn("Games"),
+                "pl":       st.column_config.NumberColumn(f"${stake:g}/game P&L", format="dollar"),
             },
         )
 
@@ -691,7 +698,7 @@ with tab_tracker:
             pg = summary["per_game"].copy()
             pg["result"] = np.where(pg["correct"], "✅", "❌")
             show_cols = ["week","home_team","away_team","home_score","away_score",
-                        "p_home_pred","pred_winner","actual_winner","result"]
+                        "p_home_pred","pred_winner","actual_winner","result","ml_price","bet_pl"]
             st.dataframe(
                 pg[[c for c in show_cols if c in pg.columns]],
                 use_container_width=True, hide_index=True,
@@ -703,6 +710,8 @@ with tab_tracker:
                     "pred_winner":  "Predicted winner",
                     "actual_winner": "Actual winner",
                     "result":       "",
+                    "ml_price":     st.column_config.NumberColumn("ML price", format="%+d"),
+                    "bet_pl":       st.column_config.NumberColumn(f"${stake:g} bet P&L", format="dollar"),
                 },
             )
             st.download_button("Download season tracker CSV", summary["per_game"].to_csv(index=False),

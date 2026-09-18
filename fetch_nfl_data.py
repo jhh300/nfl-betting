@@ -878,12 +878,14 @@ def run_backtest(sched_all: pd.DataFrame, weekly_all: pd.DataFrame, eval_seasons
 
 # ---- Season-to-date tracker: predicted winner vs actual winner ---------------
 
-def summarize_season_to_date(bt_df: pd.DataFrame) -> dict:
+def summarize_season_to_date(bt_df: pd.DataFrame, ml_stake: float = 10.0) -> dict:
     """Straight-up predicted-winner-vs-actual-winner record for every completed
     game in a walk-forward backtest (see run_backtest / TRAIN_WINDOW_SEASONS —
     each prediction only ever uses data available before that game was played,
     so this mirrors what the model would have said at kickoff). Not a betting
-    record — no odds/EV involved, just "did the model pick the right team."
+    record in the EV/edge sense — just "did the model pick the right team" —
+    but also includes what a flat `ml_stake` moneyline bet on that predicted
+    winner, every single game, would have paid at the real closing price.
     """
     if bt_df is None or bt_df.empty:
         return {}
@@ -895,24 +897,40 @@ def summarize_season_to_date(bt_df: pd.DataFrame) -> dict:
     d["home_score"] = (d["actual_total"] + d["actual_margin"]) / 2.0
     d["away_score"] =  d["actual_total"] - d["home_score"]
 
+    for c in ["home_moneyline", "away_moneyline"]:
+        if c not in d.columns: d[c] = np.nan
+    d["ml_price"] = np.where(d["pred_winner"] == d["home_team"], d["home_moneyline"], d["away_moneyline"])
+    dec = pd.to_numeric(d["ml_price"], errors="coerce").map(
+        lambda a: american_to_decimal(a) if pd.notna(a) else np.nan)
+    d["bet_pl"] = np.where(dec.notna(), np.where(d["correct"], ml_stake * (dec - 1.0), -ml_stake), np.nan)
+
     n = int(len(d))
     correct = int(d["correct"].sum())
+    n_priced = int(dec.notna().sum())
+    total_pl = float(d["bet_pl"].sum(skipna=True))
+
     weekly = (d.groupby("week", as_index=False)
-                .agg(games=("game_id", "count"), correct=("correct", "sum")))
+                .agg(games=("game_id", "count"), correct=("correct", "sum"),
+                     pl=("bet_pl", lambda s: s.sum(skipna=True))))
     weekly["record"]   = weekly.apply(lambda r: f"{int(r['correct'])}-{int(r['games']-r['correct'])}", axis=1)
     weekly["accuracy"] = weekly["correct"] / weekly["games"]
 
     keep = ["week","game_id","home_team","away_team","home_score","away_score",
-            "p_home_pred","pred_winner","actual_winner","correct","pred_margin","actual_margin"]
+            "p_home_pred","pred_winner","actual_winner","correct","pred_margin","actual_margin",
+            "ml_price","bet_pl"]
     per_game = d[[c for c in keep if c in d.columns]].sort_values(["week","game_id"]).reset_index(drop=True)
 
     return {
-        "n_games":   n,
-        "correct":   correct,
-        "incorrect": n - correct,
-        "accuracy":  (correct / n) if n else np.nan,
-        "weekly":    weekly,
-        "per_game":  per_game,
+        "n_games":     n,
+        "correct":     correct,
+        "incorrect":   n - correct,
+        "accuracy":    (correct / n) if n else np.nan,
+        "ml_stake":    ml_stake,
+        "n_priced":    n_priced,
+        "total_pl":    total_pl,
+        "roi":         (total_pl / (n_priced * ml_stake)) if n_priced else np.nan,
+        "weekly":      weekly,
+        "per_game":    per_game,
     }
 
 # ---- Model vs Vegas performance tracking -------------------------------------

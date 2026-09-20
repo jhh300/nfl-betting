@@ -311,13 +311,19 @@ FEATURE_COLS = CANDIDATE_FEATURES
 
 # ---- Feature building (leakage-free as-of join) ------------------------------
 
-_CARRYOVER_SHRINK = 0.65  # prior-season stats regress this far from the league mean
+_CARRYOVER_SHRINK = 0.65  # season-opening prior regresses this far toward the league mean
+_TAPER_GAMES = 4          # prior's blend weight decays linearly to 0 over this many current-season games
 
 def _asof_team_stats(sched: pd.DataFrame, weekly: pd.DataFrame, side: str) -> pd.DataFrame:
-    """For each game, attach the team's stats from its most recent game STRICTLY
-    BEFORE kickoff week — including across season boundaries, so week-1 and
-    offseason games use last season's form (shrunk toward the league mean)
-    instead of having no features at all."""
+    """For each game, attach the team's stats from its most recent completed
+    game strictly before kickoff, blended with a season-opening prior (the
+    team's final rolling numbers from the previous season, shrunk toward
+    that season's league mean). The prior's weight is 1.0 for a team's own
+    Week 1 (no current-season data exists yet) and decays linearly to 0 over
+    its first _TAPER_GAMES games — matching the roll4 window used elsewhere —
+    so early-season noise (a 1-game sample) doesn't fully override last
+    year's signal the moment a single game has been played.
+    """
     stat_cols = [c for c in weekly.columns if c not in ("team","season","week")]
     s = sched[["game_id","season","week",f"{side}_team"]].rename(columns={f"{side}_team":"team"}).copy()
     w = weekly[["team","season","week"]+stat_cols].copy()
@@ -328,18 +334,40 @@ def _asof_team_stats(sched: pd.DataFrame, weekly: pd.DataFrame, side: str) -> pd
     w = w.dropna(subset=["team","season","week"]).astype({"week":"int64","season":"int64"})
     if s.empty or w.empty:
         return pd.DataFrame(columns=[f"{side}_{c}" for c in stat_cols])
-    # Continuous time key so "most recent game" can reach back into the prior season
+
+    # Season-opening prior per team: each team's final rolling stat for a
+    # season, shrunk toward that season's own league mean. Looked up for
+    # game season S using prior_season == S-1.
+    league_mean_by_season = w.groupby("season")[stat_cols].mean()
+    prior = w.sort_values("week").groupby(["team","season"], as_index=False).last()
+    for c in stat_cols:
+        mu = prior["season"].map(league_mean_by_season[c])
+        prior[c] = mu + (prior[c] - mu) * _CARRYOVER_SHRINK
+    prior = prior.rename(columns={"season": "prior_season", **{c: f"_prior_{c}" for c in stat_cols}})
+    prior = prior[["team", "prior_season"] + [f"_prior_{c}" for c in stat_cols]]
+
+    # Most recent completed game strictly before kickoff (same-season if the
+    # team has played yet, else the most recent prior-season game found).
     s["t"] = s["season"]*100 + s["week"]
-    w["t"] = w["season"]*100 + w["week"]
-    w = w.rename(columns={"season":"stat_season"}).drop(columns=["week"])
-    j = pd.merge_asof(s.sort_values("t"), w.sort_values("t"), on="t", by="team",
+    w2 = w.rename(columns={"season": "stat_season", "week": "stat_week"})
+    w2["t"] = w2["stat_season"]*100 + w2["stat_week"]
+    j = pd.merge_asof(s.sort_values("t"), w2.sort_values("t"), on="t", by="team",
                       direction="backward", allow_exact_matches=False)
-    carried = j["stat_season"].notna() & (j["stat_season"] < j["season"])
-    if carried.any():
-        for c in stat_cols:
-            mu = w[c].mean()
-            if pd.notna(mu):
-                j.loc[carried, c] = mu + (j.loc[carried, c] - mu) * _CARRYOVER_SHRINK
+
+    j["_lookup_season"] = j["season"] - 1
+    j = j.merge(prior, left_on=["team", "_lookup_season"], right_on=["team", "prior_season"], how="left")
+
+    same_season = j["stat_season"].notna() & (j["stat_season"] == j["season"])
+    games_played = np.where(same_season, j["stat_week"], 0.0)
+    weight_prior = np.clip(1.0 - games_played / _TAPER_GAMES, 0.0, 1.0)
+
+    for c in stat_cols:
+        raw, pv = j[c], j[f"_prior_{c}"]
+        raw_filled = raw.fillna(pv)   # no current-season match at all -> prior only
+        pv_filled  = pv.fillna(raw)   # no prior available (dataset boundary) -> raw only
+        blended = pv_filled * weight_prior + raw_filled * (1.0 - weight_prior)
+        j[c] = np.where(pv.isna() & raw.isna(), np.nan, blended)
+
     return j.set_index("game_id")[stat_cols].rename(columns={c: f"{side}_{c}" for c in stat_cols})
 
 def build_game_features(sched: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:

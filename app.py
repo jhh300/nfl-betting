@@ -470,30 +470,36 @@ with tab_picks:
 
             feat_all_cols = fn.FEATURE_COLS
             present_feat_cols = [c for c in feat_all_cols if c in feats_all.columns]
+            gp_cols = [c for c in ["home_games_played","away_games_played"] if c in feats_all.columns]
             base_cols = ["game_id","season","week","home_team","away_team"]
             merged = merged.merge(
-                feats_all[base_cols+present_feat_cols].drop_duplicates("game_id"),
+                feats_all[base_cols+present_feat_cols+gp_cols].drop_duplicates("game_id"),
                 on=["game_id","season","week"],
                 how="left", validate="m:1", suffixes=("","_feat"))
             merged = _coalesce_team_cols(merged)
 
             game_feats = merged.drop_duplicates(subset=["game_id"]).copy().reset_index(drop=True)
-            for c in feat_all_cols:
+            for c in feat_all_cols + ["home_games_played","away_games_played"]:
                 if c not in game_feats.columns: game_feats[c] = np.nan
             X_full = game_feats[feat_all_cols].apply(pd.to_numeric, errors="coerce")
 
             mu_margin = margin_model.predict(fn.align_features_for_model(margin_model, X_full))
             mu_total  = total_model.predict(fn.align_features_for_model(total_model,  X_full))
-            p_home    = fn.win_prob_from_margin(mu_margin, s_margin)
+            sigma_mult = fn.game_sigma_multiplier(game_feats["home_games_played"], game_feats["away_games_played"])
+            sigma_margin_arr = s_margin * sigma_mult
+            sigma_total_arr  = s_total  * sigma_mult
+            p_home    = fn.win_prob_from_margin(mu_margin, sigma_margin_arr)
 
-            p_home_df     = pd.DataFrame({"game_id": game_feats["game_id"].values, "p_home_model": p_home})
-            mu_margin_map = dict(zip(game_feats["game_id"].values, mu_margin))
-            mu_total_map  = dict(zip(game_feats["game_id"].values,  mu_total))
+            p_home_df       = pd.DataFrame({"game_id": game_feats["game_id"].values, "p_home_model": p_home})
+            mu_margin_map    = dict(zip(game_feats["game_id"].values, mu_margin))
+            mu_total_map     = dict(zip(game_feats["game_id"].values,  mu_total))
+            sigma_margin_map = dict(zip(game_feats["game_id"].values, sigma_margin_arr))
+            sigma_total_map  = dict(zip(game_feats["game_id"].values, sigma_total_arr))
 
             picks_df_all = fn.assemble_picks(
                 merged, markets_choice, p_home_df,
                 mu_margin_map, mu_total_map,
-                s_margin, s_total,
+                sigma_margin_map, sigma_total_map,
                 float(kelly_bankroll), float(kelly_frac),
             )
             picks_df_live = fn.filter_bettable(picks_df_all, float(min_edge_pts))

@@ -368,7 +368,11 @@ def _asof_team_stats(sched: pd.DataFrame, weekly: pd.DataFrame, side: str) -> pd
         blended = pv_filled * weight_prior + raw_filled * (1.0 - weight_prior)
         j[c] = np.where(pv.isna() & raw.isna(), np.nan, blended)
 
-    return j.set_index("game_id")[stat_cols].rename(columns={c: f"{side}_{c}" for c in stat_cols})
+    # Exposed (not a model feature) so downstream code can widen prediction
+    # uncertainty for games where a team has little current-season data.
+    j["games_played"] = games_played
+    out_cols = stat_cols + ["games_played"]
+    return j.set_index("game_id")[out_cols].rename(columns={c: f"{side}_{c}" for c in out_cols})
 
 def build_game_features(sched: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
     for k in ["team","season","week"]:
@@ -499,10 +503,27 @@ def fit_total_model(train_df: pd.DataFrame) -> Tuple[object, float, float]:
 
 # ---- Prediction helpers -----------------------------------------------------
 
-def win_prob_from_margin(mu_margin, sigma: float) -> np.ndarray:
+SIGMA_INFLATION_K = 0.30  # extra sigma when a team has zero current-season games, tapering to 0 by _TAPER_GAMES
+
+def game_sigma_multiplier(games_played_home, games_played_away) -> np.ndarray:
+    """Widen sigma for games where either team has little current-season data.
+    A prediction resting on a 1-game sample carries more real uncertainty than
+    the model's single season-wide OOF residual std reflects; this scales that
+    std up for early-season games and back to 1.0x once both teams have played
+    _TAPER_GAMES games — the same taper window used for feature blending, so a
+    game stops being treated as "extra uncertain" exactly when its features
+    stop being treated as "still mostly last year's prior."""
+    gh = pd.to_numeric(pd.Series(games_played_home), errors="coerce").fillna(0.0).to_numpy()
+    ga = pd.to_numeric(pd.Series(games_played_away), errors="coerce").fillna(0.0).to_numpy()
+    min_gp = np.minimum(gh, ga)
+    return 1.0 + SIGMA_INFLATION_K * np.clip(1.0 - min_gp / _TAPER_GAMES, 0.0, 1.0)
+
+def win_prob_from_margin(mu_margin, sigma) -> np.ndarray:
     """P(home win) = Phi(mu/sigma) — derived from the margin model so the
-    moneyline probability, spread, and predicted scores always agree."""
-    sig = float(sigma) if sigma and sigma > 0 else 13.0
+    moneyline probability, spread, and predicted scores always agree.
+    `sigma` may be a scalar or a per-game array (e.g. from game_sigma_multiplier)."""
+    sig = np.asarray(sigma, dtype=float)
+    sig = np.where((sig > 0) & ~np.isnan(sig), sig, 13.0)
     return np.clip(norm_cdf(np.asarray(mu_margin, dtype=float) / sig), 1e-6, 1-1e-6)
 
 def prob_home_covers(line: float, mu_margin: float, sigma: float) -> float:
@@ -687,16 +708,26 @@ def assemble_picks(
     p_home_df: pd.DataFrame,
     mu_margin_map: dict,
     mu_total_map: dict,
-    s_margin: float,
-    s_total: float,
+    sigma_margin_map,
+    sigma_total_map,
     bankroll: float,
     kelly_fraction_use: float,
 ) -> pd.DataFrame:
     """Single source of truth for building picks from a merged odds+schedule frame.
     Adds `model_line` (the model's fair line for that side) and `edge_pts`
-    (points of cushion between the model's number and the book's line)."""
+    (points of cushion between the model's number and the book's line).
+    sigma_margin_map/sigma_total_map: dict {game_id: sigma} for per-game
+    uncertainty (see game_sigma_multiplier), OR a plain float to use the same
+    sigma for every game (backward-compatible)."""
     mk_map = {"moneyline": "h2h", "spreads": "spreads", "totals": "totals"}
     picks_all = []
+
+    def _sigma_lookup(sub: pd.DataFrame, sigma_map) -> np.ndarray:
+        if isinstance(sigma_map, dict):
+            sig = pd.to_numeric(sub["game_id"].map(sigma_map), errors="coerce").to_numpy()
+        else:
+            sig = np.full(len(sub), float(sigma_map) if sigma_map else np.nan)
+        return np.where(sig > 0, sig, np.nan)
 
     for mk in markets:
         sub = merged[merged["market_key"].eq(mk_map[mk])].copy()
@@ -716,7 +747,7 @@ def assemble_picks(
         elif mk == "spreads":
             mu   = pd.to_numeric(sub["game_id"].map(mu_margin_map), errors="coerce").to_numpy()
             line = pd.to_numeric(sub["line"], errors="coerce").to_numpy()
-            sig  = float(s_margin) if s_margin and s_margin > 0 else np.nan
+            sig  = _sigma_lookup(sub, sigma_margin_map)
             p = np.where(cond_home, norm_cdf((mu + line)/sig), norm_cdf((line - mu)/sig))
             sub["p_true"]     = np.where(np.isnan(mu) | np.isnan(line), np.nan, p)
             sub["model_line"] = np.where(cond_home, -mu, mu)
@@ -725,7 +756,7 @@ def assemble_picks(
         else:  # totals
             mu   = pd.to_numeric(sub["game_id"].map(mu_total_map), errors="coerce").to_numpy()
             line = pd.to_numeric(sub["line"], errors="coerce").to_numpy()
-            sig  = float(s_total) if s_total and s_total > 0 else np.nan
+            sig  = _sigma_lookup(sub, sigma_total_map)
             cond_over = (
                 sub["is_over_outcome"] if "is_over_outcome" in sub.columns else
                 sub["outcome_name"].str.lower().eq("over")
@@ -791,22 +822,28 @@ def run_picks(season: int, markets=None, books: str = "fanduel,draftkings,betmgm
     weeks = pd.to_numeric(merged["week"], errors="coerce").dropna().astype(int)
     wk_label = f"week{weeks.min()}" if weeks.min() == weeks.max() else f"weeks{weeks.min()}-{weeks.max()}"
     present = [c for c in FEATURE_COLS if c in feats_all.columns]
-    merged = merged.merge(feats_all[["game_id","season","week"]+present].drop_duplicates("game_id"),
+    gp_cols = [c for c in ["home_games_played","away_games_played"] if c in feats_all.columns]
+    merged = merged.merge(feats_all[["game_id","season","week"]+present+gp_cols].drop_duplicates("game_id"),
                           on=["game_id","season","week"], how="left", validate="m:1")
     game_feats = merged.drop_duplicates(subset=["game_id"]).copy().reset_index(drop=True)
-    for c in FEATURE_COLS:
+    for c in FEATURE_COLS + ["home_games_played","away_games_played"]:
         if c not in game_feats.columns: game_feats[c] = np.nan
     X_full = game_feats[FEATURE_COLS].apply(pd.to_numeric, errors="coerce")
     mu_margin = margin_model.predict(align_features_for_model(margin_model, X_full))
     mu_total  = total_model.predict(align_features_for_model(total_model,  X_full))
-    p_home    = win_prob_from_margin(mu_margin, s_margin)
+    sigma_mult = game_sigma_multiplier(game_feats["home_games_played"], game_feats["away_games_played"])
+    sigma_margin_arr = s_margin * sigma_mult
+    sigma_total_arr  = s_total  * sigma_mult
+    p_home    = win_prob_from_margin(mu_margin, sigma_margin_arr)
 
-    p_home_df     = pd.DataFrame({"game_id": game_feats["game_id"].values, "p_home_model": p_home})
-    mu_margin_map = dict(zip(game_feats["game_id"], mu_margin))
-    mu_total_map  = dict(zip(game_feats["game_id"],  mu_total))
+    p_home_df       = pd.DataFrame({"game_id": game_feats["game_id"].values, "p_home_model": p_home})
+    mu_margin_map    = dict(zip(game_feats["game_id"], mu_margin))
+    mu_total_map     = dict(zip(game_feats["game_id"],  mu_total))
+    sigma_margin_map = dict(zip(game_feats["game_id"], sigma_margin_arr))
+    sigma_total_map  = dict(zip(game_feats["game_id"], sigma_total_arr))
 
     df_out = assemble_picks(merged, markets, p_home_df, mu_margin_map, mu_total_map,
-                            s_margin, s_total, bankroll, kelly_fraction)
+                            sigma_margin_map, sigma_total_map, bankroll, kelly_fraction)
     df_out = filter_bettable(df_out, min_edge_pts)
     if df_out.empty: raise RuntimeError("No picks passed the edge/EV filter.")
     df_out = df_out.sort_values(["ev_per_usd","edge_vs_book_devig"], ascending=False).head(top_n)
@@ -849,7 +886,7 @@ def run_backtest(sched_all: pd.DataFrame, weekly_all: pd.DataFrame, eval_seasons
         if completed.empty:
             continue
 
-        for c in FEATURE_COLS:
+        for c in FEATURE_COLS + ["home_games_played","away_games_played"]:
             if c not in completed.columns:
                 completed[c] = np.nan
 
@@ -871,7 +908,8 @@ def run_backtest(sched_all: pd.DataFrame, weekly_all: pd.DataFrame, eval_seasons
             Xb = completed.loc[idx, FEATURE_COLS].apply(pd.to_numeric, errors="coerce")
             mu_margin[idx] = margin_model.predict(align_features_for_model(margin_model, Xb))
             mu_total[idx]  = total_model.predict(align_features_for_model(total_model,  Xb))
-        p_home = win_prob_from_margin(mu_margin, s_margin)
+        sigma_mult = game_sigma_multiplier(completed["home_games_played"], completed["away_games_played"])
+        p_home = win_prob_from_margin(mu_margin, s_margin * sigma_mult)
 
         def _col(name):
             return pd.to_numeric(completed[name], errors="coerce").values if name in completed.columns \

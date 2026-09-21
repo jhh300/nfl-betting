@@ -167,6 +167,7 @@ _ESPN_CSS = """
   text-transform:uppercase;width:52px}
 .espn-pick .sel{font-weight:700;white-space:nowrap}
 .espn-pick .odds{color:#6c6d6f;font-variant-numeric:tabular-nums}
+.espn-pick .ptrue{flex:none;font-size:11px;font-weight:600;color:#3b5bdb;font-variant-numeric:tabular-nums}
 .espn-pick .book{font-size:10.5px;color:#9a9b9d;text-transform:uppercase;letter-spacing:.3px}
 .espn-pick .ev{margin-left:auto;flex:none;font-weight:700;font-size:11px;border-radius:4px;
   padding:1px 7px;font-variant-numeric:tabular-nums}
@@ -250,11 +251,14 @@ def render_espn_picks(games: pd.DataFrame, bettable: pd.DataFrame, pred: pd.Data
                 ev_txt = f"{ev:+.1%} EV" if pd.notna(ev) else "—"
                 stake = pd.to_numeric(pd.Series([r.get("stake_usd")]), errors="coerce").iloc[0]
                 stake_txt = f"${stake:,.0f}" if pd.notna(stake) and stake > 0 else "—"
+                p_true = pd.to_numeric(pd.Series([r.get("p_true")]), errors="coerce").iloc[0]
+                p_true_txt = f"{p_true:.0%}" if pd.notna(p_true) else "—"
                 mkt = {"moneyline": "ML", "spreads": "Spread", "totals": "Total"}.get(r.get("market_key"), r.get("market_key"))
                 pick_rows.append(
                     f'<div class="espn-pick"><span class="mkt">{_esc(mkt)}</span>'
                     f'<span class="sel">{_esc(_pick_selection(r))}</span>'
                     f'<span class="odds">{_fmt_odds(r.get("odds_american"))}</span>'
+                    f'<span class="ptrue" title="Model win/cover probability">{p_true_txt}</span>'
                     f'<span class="book">{_esc(r.get("book_title") or "")}</span>'
                     f'<span class="ev {ev_cls}">{ev_txt}</span>'
                     f'<span class="stake">{stake_txt}</span></div>'

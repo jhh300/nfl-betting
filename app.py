@@ -650,6 +650,18 @@ with tab_picks:
                     f"on ${sim['total_staked']:,.0f} staked across {sim['n_bets']} bets "
                     f"(mean ${sim['mean_pl']:+,.0f})."
                 )
+
+                st.markdown("**Cumulative P&L across simulated trials**")
+                st.caption("5th/25th/50th/75th/95th percentile of running P&L as bets are placed one by one "
+                          "(x-axis is bet count, not calendar time). The band between the outer lines widens "
+                          "as more bets accumulate variance.")
+                traj = sim["trajectory_pctiles"]
+                traj_df = pd.DataFrame({f"P{q}": traj[q] for q in (5, 25, 50, 75, 95)})
+                traj_df.index = range(1, len(traj_df) + 1)
+                traj_df.index.name = "Bet #"
+                st.line_chart(traj_df)
+
+                st.markdown("**Distribution of final outcome**")
                 counts, edges = np.histogram(sim["season_pl_dist"], bins=40)
                 hist_df = pd.DataFrame({"P&L ($)": edges[:-1].round(0), "Trials": counts}).set_index("P&L ($)")
                 st.bar_chart(hist_df)

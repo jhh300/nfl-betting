@@ -1282,6 +1282,10 @@ def simulate_bankroll(picks: pd.DataFrame, n_sims: int = 5000, seed: Optional[in
     running_peak = np.maximum.accumulate(cum, axis=1)
     drawdown = np.min(cum - running_peak, axis=1)              # most negative dip below a running peak (<=0)
 
+    # Cumulative-P&L percentile bands, bet-by-bet, across all trials — a fan
+    # chart of how variance accumulates as more of these bets get placed.
+    trajectory_pctiles = {q: np.percentile(cum, q, axis=0) for q in (5, 25, 50, 75, 95)}
+
     return {
         "n_bets":        n_bets,
         "n_sims":        n_sims,
@@ -1292,4 +1296,5 @@ def simulate_bankroll(picks: pd.DataFrame, n_sims: int = 5000, seed: Optional[in
         "median_drawdown":    float(np.median(drawdown)),
         "worst_5pct_drawdown": float(np.percentile(drawdown, 5)),
         "season_pl_dist": season_pl,
+        "trajectory_pctiles": trajectory_pctiles,
     }

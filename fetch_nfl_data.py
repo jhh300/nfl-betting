@@ -1245,3 +1245,51 @@ def format_market_summary(summary: dict) -> str:
                              f"{b['units']:+.1f} units over {b['n_bets']} bets ({b['roi']:+.1%} ROI)")
         lines.append(f"  {'TOTAL':<9} {u.get('total_units', 0.0):+.1f} units")
     return "\n".join(lines)
+
+# ---- Bankroll Monte Carlo simulation -----------------------------------------
+
+def simulate_bankroll(picks: pd.DataFrame, n_sims: int = 5000, seed: Optional[int] = None) -> dict:
+    """Monte Carlo bankroll simulation over a set of not-yet-settled picks.
+
+    For each of `n_sims` trials, every pick's outcome is redrawn from
+    Bernoulli(p_true) — the model's own stated win probability for that side —
+    at the pick's actual stake_usd and odds_decimal, independent across picks.
+    This answers 'given the model's own confidence, how much variance should I
+    expect from placing exactly these bets,' not a prediction of what will
+    actually happen (there's no real outcome yet — these are live/future picks).
+
+    Returns {} if there are no priceable picks with a positive stake.
+    """
+    required = ["p_true", "odds_decimal", "stake_usd"]
+    if picks is None or picks.empty or not all(c in picks.columns for c in required):
+        return {}
+    d = picks.dropna(subset=required).copy()
+    d["stake_usd"] = pd.to_numeric(d["stake_usd"], errors="coerce")
+    d = d[d["stake_usd"] > 0]
+    if d.empty:
+        return {}
+
+    rng = np.random.default_rng(seed)
+    p     = pd.to_numeric(d["p_true"], errors="coerce").to_numpy()
+    dec   = pd.to_numeric(d["odds_decimal"], errors="coerce").to_numpy()
+    stake = d["stake_usd"].to_numpy()
+    n_bets = len(d)
+
+    wins = rng.random((n_sims, n_bets)) < p[None, :]
+    payouts = np.where(wins, stake[None, :] * (dec[None, :] - 1.0), -stake[None, :])
+    cum = np.cumsum(payouts, axis=1)                          # bankroll trajectory per trial
+    season_pl = cum[:, -1]
+    running_peak = np.maximum.accumulate(cum, axis=1)
+    drawdown = np.min(cum - running_peak, axis=1)              # most negative dip below a running peak (<=0)
+
+    return {
+        "n_bets":        n_bets,
+        "n_sims":        n_sims,
+        "total_staked":  float(stake.sum()),
+        "mean_pl":       float(season_pl.mean()),
+        "pctiles":       {q: float(np.percentile(season_pl, q)) for q in (5, 25, 50, 75, 95)},
+        "prob_positive": float((season_pl > 0).mean()),
+        "median_drawdown":    float(np.median(drawdown)),
+        "worst_5pct_drawdown": float(np.percentile(drawdown, 5)),
+        "season_pl_dist": season_pl,
+    }

@@ -626,6 +626,38 @@ with tab_picks:
             st.dataframe(pick_top(shown, top_n), use_container_width=True,
                          column_config=PICKS_COLUMN_CONFIG, hide_index=True)
 
+        with st.expander("🎲 Bankroll Simulation", expanded=False):
+            st.caption(
+                "Monte Carlo simulation over the picks in the table above: each trial redraws every "
+                "pick's outcome from the model's own stated win probability (not a real result — these "
+                "haven't been played yet), at its actual stake and price. Shows the range of outcomes "
+                "the model's own confidence implies, not a prediction of what will happen."
+            )
+            sim_bets = pick_top(shown, top_n)
+            if st.button("Run simulation (5,000 trials)", key="run_bankroll_sim"):
+                sim = fn.simulate_bankroll(sim_bets, n_sims=5000, seed=None)
+                st.session_state["bankroll_sim"] = sim
+            sim = st.session_state.get("bankroll_sim")
+            if sim:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Bets simulated", sim["n_bets"])
+                c2.metric("Median outcome", f"${sim['pctiles'][50]:+,.0f}")
+                c3.metric("Chance of profit", f"{sim['prob_positive']:.0%}")
+                c4.metric("Typical worst dip", f"${sim['median_drawdown']:+,.0f}",
+                          delta=f"5th pct: ${sim['worst_5pct_drawdown']:+,.0f}", delta_color="off")
+                st.caption(
+                    f"5th–95th percentile range: **${sim['pctiles'][5]:+,.0f}** to **${sim['pctiles'][95]:+,.0f}** "
+                    f"on ${sim['total_staked']:,.0f} staked across {sim['n_bets']} bets "
+                    f"(mean ${sim['mean_pl']:+,.0f})."
+                )
+                counts, edges = np.histogram(sim["season_pl_dist"], bins=40)
+                hist_df = pd.DataFrame({"P&L ($)": edges[:-1].round(0), "Trials": counts}).set_index("P&L ($)")
+                st.bar_chart(hist_df)
+            elif sim_bets.empty:
+                st.info("No priced picks available to simulate.")
+            else:
+                st.caption("Click the button to run the simulation.")
+
         with st.expander("📝 Share picks (tweets)", expanded=False):
             st.caption("Top 5 picks by EV for each week, formatted to post — click the copy icon "
                        "in the top-right of each box.")

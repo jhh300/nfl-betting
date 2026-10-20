@@ -58,5 +58,3 @@ Vegas closing line, and the actual result, then reports:
   to points-based features.
 - Optional team-metric CSVs (DVOA, success rate, etc.) can be uploaded in the
   sidebar; `build_extra_metrics_csvs.py` generates templates.
-- `basketball_app.py` / `basketball_cli.py` are a self-contained NBA/NCAAB
-  bolt-on (`streamlit run basketball_app.py`).

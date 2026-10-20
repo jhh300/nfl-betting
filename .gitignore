@@ -7,7 +7,7 @@
 __pycache__/
 *.pyc
 
-# Local data (bets DB, saved pick sheets, basketball cache)
+# Local data (bets DB, saved pick sheets)
 data/
 
 # OS / editor noise

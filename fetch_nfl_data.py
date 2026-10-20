@@ -792,7 +792,7 @@ def filter_bettable(picks: pd.DataFrame, min_edge_pts: float = MIN_EDGE_PTS_DEFA
 
 def run_picks(season: int, markets=None, books: str = "fanduel,draftkings,betmgm",
               bankroll: float = 10000.0, kelly_fraction: float = 0.5, top_n: int = 20,
-              save_dir: str = "./data", log_sqlite: bool = False, db_path: str = "./data/bets.db",
+              save_dir: str = "./data",
               api_key: str = None, min_edge_pts: float = MIN_EDGE_PTS_DEFAULT):
     api_key = api_key or os.getenv("THE_ODDS_API_KEY")
     if not api_key: raise ValueError("No API key provided (set THE_ODDS_API_KEY or pass --api_key)")
